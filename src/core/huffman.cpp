@@ -13,82 +13,93 @@ namespace {
 
 struct NodeCompare {
     bool operator()(const HuffmanTree& a, const HuffmanTree& b) const {
-        if (a->frequency != b->frequency) {
-            return a->frequency > b->frequency;
-        }
+        if (a->frequency != b->frequency) return a->frequency > b->frequency;
         return a->order > b->order;
     }
 };
 
 }  // namespace
 
-std::unordered_map<uint8_t, uint32_t> HuffmanCodec::count_frequencies(
-    const std::vector<uint8_t>& input) const {
-    std::unordered_map<uint8_t, uint32_t> frequencies;
-    for (uint8_t byte : input) {
-        ++frequencies[byte];
-    }
-    return frequencies;
+std::unordered_map<uint8_t, uint32_t>
+HuffmanCodec::count_frequencies(const std::vector<uint8_t>& input) const {
+    std::unordered_map<uint8_t, uint32_t> freq;
+    freq.reserve(256);
+    for (uint8_t b : input) ++freq[b];
+    return freq;
 }
 
 HuffmanTree HuffmanCodec::build_tree(
     const std::unordered_map<uint8_t, uint32_t>& frequencies) const {
-    if (frequencies.empty()) {
-        return nullptr;
-    }
+    if (frequencies.empty()) return nullptr;
 
     std::priority_queue<HuffmanTree, std::vector<HuffmanTree>, NodeCompare> heap;
-    for (const auto& entry : frequencies) {
-        auto node = std::make_shared<HuffmanNode>();
-        node->symbol = entry.first;
-        node->frequency = entry.second;
-        node->order = entry.first;
-        node->is_leaf = true;
+    for (const auto& e : frequencies) {
+        auto node       = std::make_shared<HuffmanNode>();
+        node->symbol    = e.first;
+        node->frequency = e.second;
+        node->order     = e.first;
+        node->is_leaf   = true;
         heap.push(node);
     }
 
-    // Single-symbol input: wrap in dummy parent so every code has at least one bit.
     if (heap.size() == 1) {
-        auto wrapper = std::make_shared<HuffmanNode>();
-        wrapper->frequency = heap.top()->frequency;
-        wrapper->is_leaf = false;
-        wrapper->left = heap.top();
-        wrapper->right = heap.top();
+        auto w       = std::make_shared<HuffmanNode>();
+        w->frequency = heap.top()->frequency;
+        w->is_leaf   = false;
+        w->left      = heap.top();
+        w->right     = heap.top();
         heap.pop();
-        heap.push(wrapper);
+        heap.push(w);
     }
 
     while (heap.size() > 1) {
-        auto left = heap.top();
-        heap.pop();
-        auto right = heap.top();
-        heap.pop();
-
-        auto parent = std::make_shared<HuffmanNode>();
-        parent->frequency = left->frequency + right->frequency;
-        parent->order = std::min(left->order, right->order);
-        parent->is_leaf = false;
-        parent->left = left;
-        parent->right = right;
-        heap.push(parent);
+        auto left  = heap.top(); heap.pop();
+        auto right = heap.top(); heap.pop();
+        auto par        = std::make_shared<HuffmanNode>();
+        par->frequency  = left->frequency + right->frequency;
+        par->order      = std::min(left->order, right->order);
+        par->is_leaf    = false;
+        par->left       = left;
+        par->right      = right;
+        heap.push(par);
     }
 
     return heap.top();
 }
 
+// ---------------------------------------------------------------------------
+// fill_table() – builds integer-coded lookup table instead of strings.
+// Each entry is {bit_pattern (MSB-aligned in a uint32), bit_length}.
+// This avoids per-bit string iteration during encoding.
+// ---------------------------------------------------------------------------
 void HuffmanCodec::fill_table(const HuffmanTree& node, const std::string& prefix,
-                              std::unordered_map<uint8_t, std::string>& table) const {
-    if (!node) {
-        return;
-    }
+                               std::unordered_map<uint8_t, std::string>& table) const {
+    if (!node) return;
     if (node->is_leaf) {
         table[node->symbol] = prefix.empty() ? "0" : prefix;
         return;
     }
-    fill_table(node->left, prefix + '0', table);
+    fill_table(node->left,  prefix + '0', table);
     fill_table(node->right, prefix + '1', table);
 }
 
+// Internal: fills integer-coded table for fast encoding.
+static void fill_int_table(const HuffmanTree& node, uint32_t code, int depth,
+                            std::unordered_map<uint8_t, std::pair<uint32_t,int>>& table) {
+    if (!node) return;
+    if (node->is_leaf) {
+        int len = depth == 0 ? 1 : depth;
+        uint32_t pat = depth == 0 ? 0u : code;
+        table[node->symbol] = {pat, len};
+        return;
+    }
+    fill_int_table(node->left,  (code << 1),      depth + 1, table);
+    fill_int_table(node->right, (code << 1) | 1u, depth + 1, table);
+}
+
+// ---------------------------------------------------------------------------
+// compress()
+// ---------------------------------------------------------------------------
 std::vector<uint8_t> HuffmanCodec::compress(const std::vector<uint8_t>& input) const {
     BitWriter writer;
 
@@ -100,43 +111,46 @@ std::vector<uint8_t> HuffmanCodec::compress(const std::vector<uint8_t>& input) c
     const auto frequencies = count_frequencies(input);
     const HuffmanTree tree = build_tree(frequencies);
 
-    std::unordered_map<uint8_t, std::string> codes;
-    fill_table(tree, "", codes);
+    // Build integer-coded table for fast bit emission.
+    std::unordered_map<uint8_t, std::pair<uint32_t,int>> int_codes;
+    int_codes.reserve(256);
+    fill_int_table(tree, 0u, 0, int_codes);
 
+    // Header: original size + frequency table.
     writer.write_uint32(static_cast<uint32_t>(input.size()));
-
-    const uint32_t unique_count = static_cast<uint32_t>(frequencies.size());
-    writer.write_uint32(unique_count);
+    writer.write_uint32(static_cast<uint32_t>(frequencies.size()));
 
     std::map<uint8_t, uint32_t> sorted_freq(frequencies.begin(), frequencies.end());
-    for (const auto& entry : sorted_freq) {
-        writer.write_uint8(entry.first);
-        writer.write_uint32(entry.second);
+    for (const auto& e : sorted_freq) {
+        writer.write_uint8(e.first);
+        writer.write_uint32(e.second);
     }
 
+    // Encode: emit bits using integer codes (no per-char string traversal).
     for (uint8_t byte : input) {
-        const std::string& code = codes.at(byte);
-        for (char bit : code) {
-            writer.write_bit(bit == '1');
-        }
+        const auto& [pat, len] = int_codes.at(byte);
+        for (int i = len - 1; i >= 0; --i)
+            writer.write_bit(((pat >> i) & 1u) != 0u);
     }
 
     return writer.finish();
 }
 
+// ---------------------------------------------------------------------------
+// decompress()
+// ---------------------------------------------------------------------------
 std::vector<uint8_t> HuffmanCodec::decompress(const std::vector<uint8_t>& input) const {
     BitReader reader(input);
     const uint32_t original_size = reader.read_uint32();
-    if (original_size == 0) {
-        return {};
-    }
+    if (original_size == 0) return {};
 
     const uint32_t unique_count = reader.read_uint32();
     std::unordered_map<uint8_t, uint32_t> frequencies;
+    frequencies.reserve(unique_count);
     for (uint32_t i = 0; i < unique_count; ++i) {
-        const uint8_t symbol = reader.read_uint8();
+        const uint8_t sym  = reader.read_uint8();
         const uint32_t freq = reader.read_uint32();
-        frequencies[symbol] = freq;
+        frequencies[sym] = freq;
     }
 
     const HuffmanTree tree = build_tree(frequencies);
@@ -145,16 +159,13 @@ std::vector<uint8_t> HuffmanCodec::decompress(const std::vector<uint8_t>& input)
 
     HuffmanTree node = tree;
     while (output.size() < original_size) {
-        if (!node) {
-            throw std::runtime_error("HuffmanCodec: invalid tree during decode");
-        }
+        if (!node) throw std::runtime_error("HuffmanCodec: invalid tree during decode");
         if (node->is_leaf) {
             output.push_back(node->symbol);
             node = tree;
             continue;
         }
-        const bool bit = reader.read_bit();
-        node = bit ? node->right : node->left;
+        node = reader.read_bit() ? node->right : node->left;
     }
 
     return output;
